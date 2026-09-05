@@ -27,3 +27,9 @@ compatibility_date = "2026-01-01"
 # RELAY_REASONING_STYLE = "auto"            # effort|responses|anthropic|gemini|openrouter|glm|off
 # RELAY_REASONING_ANTHROPIC_MODE = "auto"   # auto|budget|adaptive
 # RELAY_REASONING_GEMINI_FIELD = "thinkingBudget"  # or thinkingLevel
+# IP-based directive memory (per-isolate, best-effort on Cloudflare; sessions are authoritative).
+# RELAY_IP_MEMORY = "true"
+# RELAY_IP_MEMORY_TTL_SECONDS = "86400"
+# RELAY_IP_MEMORY_MAX_ENTRIES = "10000"
+# RELAY_IP_MEMORY_INCLUDE_KEY = "true"
+# RELAY_IP_TRUST_FORWARDED = "false"        # never enable publicly; forwarded headers are forgeable

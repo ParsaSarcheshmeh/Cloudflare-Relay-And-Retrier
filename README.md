@@ -71,6 +71,31 @@ The numeric rules are enforced, not guessed: Claude's `budget_tokens` is derived
 
 Reasoning effort also travels in session tokens, so subagents inherit it (see below). Override the auto-detection with `RELAY_REASONING_STYLE` (`effort`/`responses`/`anthropic`/`gemini`/`openrouter`/`glm`/`off`), pick Claude's shape with `RELAY_REASONING_ANTHROPIC_MODE` (`auto`/`budget`/`adaptive`), or turn the whole feature off with `RELAY_REASONING=false`.
 
+### IP memory + model-name flags: zero-cooperation stickiness
+
+Session tokens need the client to echo them. Two more mechanisms remove even that requirement:
+
+**IP memory.** When a request resolves directives, the relay remembers them for the caller's IP (24 h sliding TTL). Later requests from the same IP with *no* directives — subagents, post-compaction turns — inherit provider, model, compatibility, reasoning effort and key automatically:
+
+```
+request 1 (your IP): "hello [provider=https://api.b.ai/v1] [model=glm-5.3-flash] [key=sk-x] [reasoning=max]"
+request 2 (same IP): {"model":"glm-5.3-flash","messages":[…]}   ← provider, key, reasoning all applied
+request (other IP):  ← inherits nothing
+```
+
+- Precedence stays first-occurrence-wins: **body > model flags > query > header > session token > IP memory**. A partial request (say, just `[model=other]`) overrides only what it names.
+- The IP comes **only** from `cf-connecting-ip`, which Cloudflare's edge sets and clients cannot forge. `X-Forwarded-For`/`X-Real-IP` are ignored unless you enable `RELAY_IP_TRUST_FORWARDED` (local proxy setups) — otherwise anyone could steal another IP's remembered key by faking a header.
+- Scope: the memory is per-isolate. The bundled dev server (one process) is authoritative; on Cloudflare it is best-effort — most requests hit a warm isolate, but for a hard guarantee echo the stateless session token.
+- Caveat: everyone behind one public IP (office NAT, VPN) shares a routing slot. Disable with `RELAY_IP_MEMORY=false`.
+
+**Model-name flags.** Clients that can only set a model string (no prompt, no headers) can embed routing in it:
+
+```
+model: "glm-5.3-flash@https://api.b.ai/v1@key=sk-x"
+```
+
+Each `@`-separated flag is one of: an `http(s)` URL or bare host (provider), a `RELAY_NAMED_PROVIDERS` name, `key=…`/`apikey=…`/`k=…`, or `compatibility=…`/`compat=…`/`c=…`. The provider receives the **clean** model name; any unrecognized segment (e.g. `weird@name`) leaves the string untouched, so ordinary model names containing `@` are never mangled. Flags also stick to the IP afterwards, and `[model=…]` text directives keep first-wins priority over them.
+
 ### Sticky sessions: the subagent & compaction problem
 
 In-prompt directives only exist in text the **user** wrote. Two common situations break that:
@@ -266,6 +291,8 @@ Everything in `BASE_CONFIG` can be overridden with plain-text Worker variables:
 | `RELAY_STRIP_PATH_PREFIX` | `""` | Strip e.g. `/relay` off the incoming path |
 | `RELAY_ACCEPT_QUERY_DIRECTIVES` / `RELAY_ACCEPT_HEADER_DIRECTIVES` | `true` / `true` | Secondary directive sources |
 | `RELAY_SESSIONS` / `RELAY_SESSION_TTL_SECONDS` / `RELAY_SESSION_SECRET` / `RELAY_SESSION_INCLUDE_KEY` / `RELAY_SESSION_COOKIE` | `true` / `604800` / `""` / `true` / `true` | Sticky session tokens (set a secret to encrypt them) |
+| `RELAY_IP_MEMORY` / `RELAY_IP_MEMORY_TTL_SECONDS` / `RELAY_IP_MEMORY_MAX_ENTRIES` / `RELAY_IP_MEMORY_INCLUDE_KEY` | `true` / `86400` / `10000` / `true` | Directives that stick to the caller's IP |
+| `RELAY_IP_TRUST_FORWARDED` | `false` | Also trust `X-Forwarded-For`/`X-Real-IP` for the client IP (local proxies only — forgeable otherwise) |
 | `RELAY_NAMED_PROVIDERS` | `""` | Path/query provider aliases: `name=https://provider/v1,…` |
 | `RELAY_REASONING` / `RELAY_REASONING_STYLE` / `RELAY_REASONING_ANTHROPIC_MODE` / `RELAY_REASONING_GEMINI_FIELD` | `true` / `auto` / `auto` / `thinkingBudget` | Reasoning-effort mapping |
 | `RELAY_REASONING_MIN_BUDGET` / `RELAY_REASONING_MAX_BUDGET` | `1024` / `128000` | Thinking-budget clamps |
@@ -321,7 +348,7 @@ RELAY_ALLOW_PRIVATE_NETWORKS = "true"
 ### Tests
 
 ```bash
-npm test    # 159 tests: unit (57) + reasoning (26) + sessions (11) + integration (65)
+npm test    # 184 tests: unit (57) + reasoning (26) + sessions (11) + ip-memory (15) + integration (75)
 ```
 
 Two local-run behaviours worth knowing:

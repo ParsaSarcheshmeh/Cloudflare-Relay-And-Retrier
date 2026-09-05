@@ -54,9 +54,17 @@ async function handle(req, res) {
     const hasBody = method !== "GET" && method !== "HEAD";
     const body = hasBody ? await readRequestBody(req) : undefined;
 
+    // Local stand-in for Cloudflare's edge header so IP-based features work. An
+    // explicitly provided value is honored so several IPs can be simulated locally
+    // (the real edge always replaces this header, so production is unaffected).
+    const requestHeaders = { ...req.headers };
+    if (!requestHeaders["cf-connecting-ip"]) {
+      requestHeaders["cf-connecting-ip"] = (req.socket.remoteAddress || "127.0.0.1").replace(/^::ffff:/, "");
+    }
+
     const request = new Request(url, {
       method,
-      headers: req.headers,
+      headers: requestHeaders,
       body: body && body.byteLength > 0 ? body : undefined,
     });
 

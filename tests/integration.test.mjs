@@ -846,6 +846,145 @@ test("an explicit numeric budget survives the session round trip", async () => {
 });
 
 /* -------------------------------------------------------------------------- *
+ * IP memory + model-name routing flags
+ * -------------------------------------------------------------------------- */
+
+function ip(ip) {
+  return { "CF-Connecting-IP": ip };
+}
+
+test("REGRESSION: directives from one request stick to the IP for later requests", async () => {
+  // First request: full directives, like the user's own prompt.
+  const first = await postJson("/v1/chat/completions", {
+    messages: [{ role: "user", content: `hello [provider=${origin}/v1][model=sticky-model][key=IP-KEY]` }],
+  }, { headers: ip("198.51.100.20") });
+  assert.equal(first.response.status, 200);
+
+  // Second request from the SAME IP: no directives at all (subagent / post-compaction).
+  const second = await postJson("/v1/chat/completions", {
+    messages: [{ role: "user", content: "follow-up with nothing in it" }],
+  }, { headers: ip("198.51.100.20") });
+  assert.equal(second.response.status, 200);
+  assert.equal(second.json.path, "/v1/chat/completions");
+  assert.equal(second.json.received.model, "sticky-model", "the model must stick to the IP");
+  assert.equal(second.json.authorization, "Bearer IP-KEY", "the key must stick to the IP");
+  assert.equal(second.json.received.messages[0].content, "follow-up with nothing in it");
+  // A session token is issued too, giving the client a stateless handle as well.
+  assert.match(second.response.headers.get("X-Relay-Session"), /^rls1_/);
+});
+
+test("another IP inherits nothing", async () => {
+  await postJson("/v1/chat/completions", {
+    messages: [{ role: "user", content: `hello [provider=${origin}/v1][model=private-model][key=K]` }],
+  }, { headers: ip("198.51.100.30") });
+
+  const stranger = await postJson("/v1/chat/completions", {
+    messages: [{ role: "user", content: "hello from a different network" }],
+  }, { headers: ip("198.51.100.31") });
+  assert.equal(stranger.response.status, 400);
+  assert.equal(stranger.json.error.code, "missing_provider");
+});
+
+test("IP memory only fills the gaps: partial directives still win", async () => {
+  await postJson("/v1/chat/completions", {
+    messages: [{ role: "user", content: `hi [provider=${origin}/v1][model=base-model][key=BASE-KEY]` }],
+  }, { headers: ip("198.51.100.40") });
+
+  const partial = await postJson("/v1/chat/completions", {
+    messages: [{ role: "user", content: "switch [model=override-model]" }],
+  }, { headers: ip("198.51.100.40") });
+  assert.equal(partial.json.received.model, "override-model");
+  assert.equal(partial.json.authorization, "Bearer BASE-KEY", "provider/key still come from IP memory");
+});
+
+test("a spoofed forwarded header cannot steal another IP's routing", async () => {
+  await postJson("/v1/chat/completions", {
+    messages: [{ role: "user", content: `hi [provider=${origin}/v1][model=victim-model][key=VICTIM-KEY]` }],
+  }, { headers: ip("198.51.100.50") });
+
+  // The attacker forges X-Forwarded-For / X-Real-IP — those are ignored by default.
+  const attacker = await postJson("/v1/chat/completions", {
+    messages: [{ role: "user", content: "steal it" }],
+  }, { headers: { "CF-Connecting-IP": "198.51.100.60", "X-Forwarded-For": "198.51.100.50", "X-Real-IP": "198.51.100.50" } });
+  assert.equal(attacker.response.status, 400, "the forged identity must not match the victim's IP");
+  assert.equal(attacker.json.error.code, "missing_provider");
+});
+
+test("REGRESSION: routing flags inside the model name configure the request", async () => {
+  const { response, json } = await postJson("/v1/chat/completions", {
+    model: `glm-5.3-flash@${origin}/v1@key=FLAG-KEY`,
+    messages: [{ role: "user", content: "hi" }],
+  });
+  assert.equal(response.status, 200);
+  assert.equal(json.path, "/v1/chat/completions");
+  assert.equal(json.received.model, "glm-5.3-flash", "the provider must get the clean model name");
+  assert.equal(json.authorization, "Bearer FLAG-KEY");
+  assert.equal(JSON.stringify(json.received).includes("@"), false, "no flag residue may reach the provider");
+  // The flags stick to the IP afterwards, too.
+  const followUp = await postJson("/v1/chat/completions", {
+    model: "glm-5.3-flash",
+    messages: [{ role: "user", content: "again" }],
+  }, { headers: ip("198.51.100.70") });
+  assert.equal(followUp.response.status, 400, "the flags came from the body model, not from an IP that sent them");
+});
+
+test("model flags with a named provider and compatibility", async () => {
+  const env = { ...ENV, RELAY_NAMED_PROVIDERS: `mock=${origin}/v1` };
+  const { json } = await postJson("/v1/chat/completions", {
+    model: "some-model@mock@c=openai",
+    messages: [{ role: "user", content: "hi" }],
+  }, { env, headers: ip("198.51.100.80") });
+  assert.equal(json.path, "/v1/chat/completions");
+  assert.equal(json.received.model, "some-model");
+});
+
+test("a text directive beats model-name flags (first occurrence wins)", async () => {
+  const { json } = await postJson("/v1/chat/completions", {
+    model: `flag-model@${origin}/v1`,
+    messages: [{ role: "user", content: "hi [model=text-model]" }],
+  }, { headers: ip("198.51.100.90") });
+  assert.equal(json.received.model, "text-model", "the in-prompt directive wins");
+  assert.equal(json.path, "/v1/chat/completions", "the provider flag still filled the gap");
+});
+
+test("model names that merely contain @ are forwarded untouched", async () => {
+  const { json } = await postJson("/v1/chat/completions", {
+    model: "weird@model@name",
+    messages: [{ role: "user", content: `hi [provider=${origin}/v1]` }],
+  });
+  assert.equal(json.received.model, "weird@model@name", "unrecognizable flags must not be mangled");
+});
+
+test("REGRESSION: IP memory and reasoning survive into a subagent request", async () => {
+  const parent = await postJson("/v1/chat/completions", {
+    messages: [
+      { role: "user", content: `parent [provider=${origin}/v1][model=deep-model][key=IPR][reasoning=max]` },
+    ],
+  }, { headers: ip("198.51.100.100") });
+  assert.equal(parent.json.received.reasoning_effort, "max");
+
+  const subagent = await postJson("/v1/chat/completions", {
+    messages: [{ role: "user", content: "child task" }],
+  }, { headers: ip("198.51.100.100") });
+  assert.equal(subagent.json.received.reasoning_effort, "max", "reasoning must stick to the IP");
+  assert.equal(subagent.json.received.model, "deep-model");
+  assert.equal(subagent.json.authorization, "Bearer IPR");
+});
+
+test("RELAY_IP_MEMORY=false disables the behavior", async () => {
+  const env = { ...ENV, RELAY_IP_MEMORY: "false" };
+  const first = await postJson("/v1/chat/completions", {
+    messages: [{ role: "user", content: `hi [provider=${origin}/v1][model=m]` }],
+  }, { env, headers: ip("198.51.100.110") });
+  assert.equal(first.response.status, 200);
+
+  const second = await postJson("/v1/chat/completions", {
+    messages: [{ role: "user", content: "nothing" }],
+  }, { env, headers: ip("198.51.100.110") });
+  assert.equal(second.response.status, 400, "without IP memory there is no inheritance");
+});
+
+/* -------------------------------------------------------------------------- *
  * Retry behaviour
  * -------------------------------------------------------------------------- */
 

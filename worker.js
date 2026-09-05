@@ -203,6 +203,18 @@ const BASE_CONFIG = {
   },
 
   /**
+   * Directives that stick to the caller's IP (see section 6c for semantics and
+   * limits). Only cf-connecting-ip is trusted by default.
+   */
+  ipMemory: {
+    enabled: true,
+    ttlSeconds: 24 * 3600,
+    maxEntries: 10000,
+    includeKey: true,
+    trustForwardedHeaders: false,
+  },
+
+  /**
    * Reasoning / thinking effort. Every provider spells this differently, so the
    * directive carries INTENT ("think harder") and the relay writes it into whichever
    * field the target API actually accepts. Verified against provider docs:
@@ -809,6 +821,69 @@ function parseReasoningValue(value) {
   return undefined;
 }
 
+/**
+ * Routing flags embedded IN the model name, for clients that can only set a model
+ * string (no prompt access, no headers). Syntax:
+ *   <model>@<flag>[@<flag>…]   e.g. glm-5.3-flash@https://api.b.ai/v1@key=sk-x
+ * Each flag must be one of:
+ *   - an absolute http(s) URL            -> provider
+ *   - a bare host ("api.b.ai/v1")        -> provider (https:// prepended)
+ *   - a RELAY_NAMED_PROVIDERS name       -> provider
+ *   - key=… / apikey=… / k=…             -> API key
+ *   - compatibility=… / compat=… / c=…   -> compatibility mode
+ * If ANY segment is unrecognized the whole string is left untouched, so ordinary
+ * model names containing "@" never get mangled.
+ */
+function extractModelFlags(modelString, cfg) {
+  if (typeof modelString !== "string") return null;
+  const at = modelString.indexOf("@");
+  if (at <= 0 || at === modelString.length - 1) return null;
+
+  const model = modelString.slice(0, at).trim();
+  const flags = { model: model === "" ? null : model, provider: undefined, apiKey: undefined, compatibility: undefined };
+  let matchedAny = false;
+
+  for (const rawSegment of modelString.slice(at + 1).split("@")) {
+    const segment = rawSegment.trim();
+    if (segment === "") return null;
+    const lower = segment.toLowerCase();
+
+    if (/^https?:\/\//i.test(segment)) {
+      flags.provider ??= segment;
+      matchedAny = true;
+      continue;
+    }
+    // A bare host with a public TLD, same convenience rule as provider validation.
+    if (/^[a-z0-9._~%-]+\.[a-z]{2,}(:\d+)?([/?#]|$)/i.test(segment)) {
+      flags.provider ??= `https://${segment}`;
+      matchedAny = true;
+      continue;
+    }
+    if (cfg.namedProviders.size > 0 && cfg.namedProviders.has(lower)) {
+      flags.provider ??= cfg.namedProviders.get(lower);
+      matchedAny = true;
+      continue;
+    }
+    const keyMatch = segment.match(/^(?:key|apikey|api_key|k)=(.+)$/i);
+    if (keyMatch && keyMatch[1].trim() !== "") {
+      flags.apiKey ??= keyMatch[1].trim();
+      matchedAny = true;
+      continue;
+    }
+    const compatMatch = segment.match(/^(?:compatibility|compat|c)=(.+)$/i);
+    if (compatMatch) {
+      const compatibility = normalizeCompatibility(compatMatch[1]);
+      if (!compatibility) return null;
+      flags.compatibility ??= compatibility;
+      matchedAny = true;
+      continue;
+    }
+    return null; // Unrecognized segment: not model flags after all.
+  }
+
+  return matchedAny ? flags : null;
+}
+
 function boolFromEnv(value, fallback) {
   if (value === undefined || value === null || value === "") return fallback;
   const parsed = parseBooleanValue(value);
@@ -937,6 +1012,7 @@ function resolveConfig(env) {
       cookieName: base.sessions.cookieName,
       emitCookie: boolFromEnv(e.RELAY_SESSION_COOKIE, base.sessions.emitCookie),
     },
+    ipMemory: resolveConfiguredIpMemory(e),
     namedProviders: parseNamedProviders(e.RELAY_NAMED_PROVIDERS),
     reasoning: {
       enabled: boolFromEnv(e.RELAY_REASONING, base.reasoning.enabled),
@@ -1510,6 +1586,125 @@ async function resolveExplicitSessionToken(request, searchParams, cfg, consumedQ
 }
 
 /* ========================================================================== *
+ * 6c. IP MEMORY — directives that stick to the caller's IP
+ * ========================================================================== *
+ *
+ * The same problem session tokens solve, but with zero client cooperation: once an
+ * IP has sent a request with directives, later requests from that IP that lack them
+ * inherit the remembered provider/model/compatibility/reasoning/key. This covers
+ * AI-agent subagents (fresh conversations with model-chosen prompts) and post-
+ * compaction turns without any token echo.
+ *
+ * Precedence stays first-occurrence-wins:
+ *   body > model-name flags > query > header > session token > IP memory
+ *
+ * SCOPE AND LIMITS, stated honestly:
+ *   - Storage is this isolate's memory. On a single process (the bundled dev server)
+ *     it is authoritative; on Cloudflare it is best-effort — requests may land on a
+ *     different isolate in the same colo and miss the memory. When you need a hard
+ *     guarantee, echo the X-Relay-Session token, which is stateless and always works.
+ *   - The client IP is taken ONLY from `cf-connecting-ip`, which Cloudflare's edge
+ *     sets and clients cannot spoof. X-Forwarded-For / X-Real-IP are client-supplied
+ *     and would let an attacker steal another IP's remembered key, so they are
+ *     ignored unless RELAY_IP_TRUST_FORWARDED is explicitly enabled (local proxies).
+ *   - Everyone behind the same public IP (office NAT, VPN) shares one memory slot.
+ */
+
+const IP_MEMORY = new Map(); // ip -> { values, expiresAt }
+
+function resolveConfiguredIpMemory(env) {
+  const base = BASE_CONFIG.ipMemory;
+  return {
+    enabled: boolFromEnv(env.RELAY_IP_MEMORY, base.enabled),
+    ttlSeconds: numFromEnv(env.RELAY_IP_MEMORY_TTL_SECONDS, base.ttlSeconds, 10),
+    maxEntries: numFromEnv(env.RELAY_IP_MEMORY_MAX_ENTRIES, base.maxEntries, 1),
+    includeKey: boolFromEnv(env.RELAY_IP_MEMORY_INCLUDE_KEY, base.includeKey),
+    trustForwarded: boolFromEnv(env.RELAY_IP_TRUST_FORWARDED, base.trustForwardedHeaders),
+  };
+}
+
+/** The caller's IP. Only edge-set headers by default; forwarded headers are opt-in. */
+function resolveClientIp(request, cfg) {
+  const direct = request.headers.get("cf-connecting-ip");
+  if (direct && direct.trim() !== "") return direct.trim();
+  if (cfg.ipMemory.trustForwarded) {
+    const real = request.headers.get("x-real-ip");
+    if (real && real.trim() !== "") return real.trim();
+    const forwarded = request.headers.get("x-forwarded-for");
+    if (forwarded) {
+      const first = forwarded.split(",")[0].trim();
+      if (first !== "") return first;
+    }
+  }
+  return null;
+}
+
+/** Which resolved directive values are worth remembering for this IP. */
+function ipMemoryValuesFromState(state, cfg) {
+  const values = {};
+  for (const key of ["provider", "model", "compatibility", "reasoning"]) {
+    if (state.values[key] !== undefined) values[key] = state.values[key];
+  }
+  if (cfg.ipMemory.includeKey && state.values.apiKey !== undefined) {
+    values.apiKey = state.values.apiKey;
+  }
+  return values;
+}
+
+function rememberDirectivesForIp(ip, state, cfg, now = Date.now()) {
+  if (!cfg.ipMemory.enabled || !ip || !state.found) return;
+  const values = ipMemoryValuesFromState(state, cfg);
+  if (Object.keys(values).length === 0) return;
+
+  if (!IP_MEMORY.has(ip) && IP_MEMORY.size >= cfg.ipMemory.maxEntries) {
+    // Evict the oldest entry (Map iterates in insertion order).
+    const oldest = IP_MEMORY.keys().next().value;
+    IP_MEMORY.delete(oldest);
+  }
+  IP_MEMORY.set(ip, {
+    values,
+    expiresAt: now + cfg.ipMemory.ttlSeconds * 1000,
+    updated: now,
+  });
+}
+
+/** Recall this IP's remembered directives, refreshing the sliding TTL on a hit. */
+function recallDirectivesForIp(ip, cfg, now = Date.now()) {
+  if (!cfg.ipMemory.enabled || !ip) return null;
+  const entry = IP_MEMORY.get(ip);
+  if (!entry) return null;
+  if (entry.expiresAt <= now) {
+    IP_MEMORY.delete(ip);
+    return null;
+  }
+  entry.expiresAt = now + cfg.ipMemory.ttlSeconds * 1000;
+
+  const state = createDirectiveState();
+  for (const spec of DIRECTIVE_SPECS) {
+    if (spec.multiple) continue;
+    const value = entry.values[spec.key];
+    if (value !== undefined) {
+      state.values[spec.key] = value;
+      state.sources[spec.key] = "ip";
+    }
+  }
+  state.found = true;
+  return state;
+}
+
+/** Test/diagnostics helper: forget everything. */
+function clearIpMemory() {
+  IP_MEMORY.clear();
+}
+
+/** Test/diagnostics helper: a plain-object copy of the current memory table. */
+function ipMemorySnapshot() {
+  const snapshot = {};
+  for (const [ip, entry] of IP_MEMORY) snapshot[ip] = entry.values;
+  return snapshot;
+}
+
+/* ========================================================================== *
  * 7. JSON TRAVERSAL
  * ========================================================================== */
 
@@ -1989,6 +2184,7 @@ async function prepareRequestBody(request, state, cfg) {
         kind: "json",
         mutated: ctx.mutated,
         textSessionState,
+        bodyModel: isPlainObject(parsed) && typeof parsed.model === "string" ? parsed.model : undefined,
       };
     }
     return await bufferOpaqueBody(request, cfg, "json-oversize");
@@ -3158,16 +3354,30 @@ function helpResponse(cfg, request) {
     rules: [
       "The first valid occurrence of each directive wins; later duplicates are ignored but still removed.",
       "Recognized directives are stripped from the text the model sees. Unknown [bracket] text and Markdown links are left alone.",
-      "Directives may also be sent as query parameters (?provider=…) or X-Relay-* headers, which is how binary uploads reach a provider.",
-      "Sticky sessions: every response with directives returns an X-Relay-Session token. Echo it via that header, ?relay_session=, or the relay_session cookie (or paste it into a subagent's prompt) to reuse provider/model/key on requests that no longer contain the directives — e.g. AI-agent subagents or after history compaction.",
+      "Directives may also be sent as query parameters (?provider=…), X-Relay-* headers, or flags inside the model name (model@provider@key=…).",
+      "Sticky routing: directives are remembered per client IP (CF-Connecting-IP) and every response also returns an X-Relay-Session token. Later requests with no directives — AI-agent subagents, post-compaction turns — inherit both. Priority: body > model flags > query > header > token > IP.",
     ],
     stickySessions: {
-      why: "Subagent prompts are written by the parent model and compaction rewrites history, so in-prompt directives do not survive either. The session token travels outside the prompt.",
-      how: "Send the token back as header X-Relay-Session: <token>, query ?relay_session=<token>, cookie relay_session=<token>, or anywhere in the prompt text.",
+      why: "Subagent prompts are written by the parent model and compaction rewrites history, so in-prompt directives do not survive either. The session token travels outside the prompt, and IP memory needs no client cooperation at all.",
+      how: "Send the token back as header X-Relay-Session: <token>, query ?relay_session=<token>, cookie relay_session=<token>, or anywhere in the prompt text. Alternatively just call again from the same IP with no directives and the last resolved routing is reused.",
       encrypted: cfg.sessions.secret
         ? "tokens are AES-GCM encrypted (RELAY_SESSION_SECRET is set)"
         : "tokens are readable base64 (set RELAY_SESSION_SECRET to encrypt them) — treat them like API keys",
       tokenPrefix: SESSION_TOKEN_PREFIX,
+    },
+    ipMemory: {
+      enabled: cfg.ipMemory.enabled,
+      ttlSeconds: cfg.ipMemory.ttlSeconds,
+      scope: cfg.ipMemory.trustForwardedHeaders
+        ? "CF-Connecting-IP plus forwarded headers (trusted mode)"
+        : "CF-Connecting-IP only (spoof-proof); storage is per-isolate, best-effort on Cloudflare",
+      caveat: "everyone behind the same public IP shares one routing slot",
+    },
+    modelFlags: {
+      syntax: "<model>@<flag>[@<flag>…]",
+      flags: ["https://provider/v1 (or a bare host)", "a RELAY_NAMED_PROVIDERS name", "key=… / apikey=… / k=…", "compatibility=… / compat=… / c=…"],
+      example: "glm-5.3-flash@https://api.b.ai/v1@key=sk-x",
+      note: "any unrecognized segment leaves the model name untouched",
     },
     namedProviders:
       cfg.namedProviders.size > 0
@@ -3246,6 +3456,50 @@ async function handleRelay(request, env) {
     return relayError(prepared.error.code, prepared.error.message, { cfg, request });
   }
 
+  // ---- 1b. routing flags embedded in the model name ----------------------------
+  // Clients that can only set a model string get full routing:
+  //   "glm-5.3-flash@https://api.b.ai/v1@key=sk-x" -> model + provider + key.
+  // Flags are looked for in the directive model first, then the body's own model
+  // field (so a body model can still supply the provider for a text-chosen model).
+  // Text directives keep first-wins priority for the model itself; flag values only
+  // fill the gaps. The provider always sees a cleaned model name.
+  {
+    const candidates = [];
+    if (typeof state.values.model === "string") candidates.push(state.values.model);
+    if (
+      typeof prepared.bodyModel === "string" &&
+      prepared.bodyModel !== state.values.model &&
+      prepared.bodyModel.includes("@")
+    ) {
+      candidates.push(prepared.bodyModel);
+    }
+
+    for (const candidate of candidates) {
+      const flags = extractModelFlags(candidate, cfg);
+      if (!flags) continue;
+
+      state.found = true;
+      if (flags.provider !== undefined && state.values.provider === undefined) {
+        state.values.provider = flags.provider;
+        state.sources.provider = "model-flag";
+      }
+      if (flags.apiKey !== undefined && state.values.apiKey === undefined) {
+        state.values.apiKey = flags.apiKey;
+        state.sources.apiKey = "model-flag";
+      }
+      if (flags.compatibility !== undefined && state.values.compatibility === undefined) {
+        state.values.compatibility = flags.compatibility;
+        state.sources.compatibility = "model-flag";
+      }
+      // The cleaned name replaces the operative model string only — never a
+      // directive-chosen model from a different source.
+      if (flags.model !== null && (state.values.model === undefined || candidate === state.values.model)) {
+        state.values.model = flags.model;
+      }
+      break; // The first model string with valid flags wins.
+    }
+  }
+
   // ---- 2. directives from query params, then X-Relay-* headers -----------------
   const fallback = createDirectiveState();
   let consumedQueryParams = [];
@@ -3268,6 +3522,12 @@ async function handleRelay(request, env) {
   );
   if (explicitSession) mergeFallbackDirectives(state, explicitSession);
   if (prepared.textSessionState) mergeFallbackDirectives(state, prepared.textSessionState);
+
+  // IP memory is the lowest-priority source: it fills whatever is still missing for
+  // requests from an IP that configured routing earlier (subagents, compaction).
+  const clientIp = resolveClientIp(request, cfg);
+  const ipState = recallDirectivesForIp(clientIp, cfg);
+  if (ipState) mergeFallbackDirectives(state, ipState);
 
   // ---- 2b. named provider from the path or as a directive value ----------------
   let effectiveUrl = incomingUrl;
@@ -3309,9 +3569,11 @@ async function handleRelay(request, env) {
   }
   const providerUrl = validated.url;
 
-  // ---- 3b. session token for later requests (subagents, compaction) ------------
-  // Emitted whenever directives were resolved from any source, so clients can pin
-  // the same routing to future requests that no longer contain the directives.
+  // ---- 3b. remember + token ------------------------------------------------------
+  // Directives resolved from any source are remembered for this IP and encoded into
+  // a session token, so future requests (subagents, compaction) can reroute without
+  // repeating any of it.
+  rememberDirectivesForIp(clientIp, state, cfg);
   const sessionToken = cfg.sessions.enabled && state.found ? await encodeSessionToken(state, cfg) : null;
 
   // ---- 4. compatibility + target URL ------------------------------------------
@@ -3462,6 +3724,7 @@ export const __internals = {
   applyDirectivesToJsonBody,
   applyReasoningToJsonBody,
   buildTargetUrl,
+  clearIpMemory,
   computeBackoffDelay,
   createDirectiveState,
   createTraversalContext,
@@ -3469,7 +3732,9 @@ export const __internals = {
   detectCompatibilityFromPath,
   encodeSessionToken,
   extractDirectivesFromText,
+  extractModelFlags,
   findBlockedHostReason,
+  ipMemorySnapshot,
   isRetryableStatus,
   joinProviderPath,
   levelForBudget,
@@ -3481,7 +3746,10 @@ export const __internals = {
   parseReasoningValue,
   parseRetryAfter,
   readBodyWithCap,
+  recallDirectivesForIp,
   redact,
+  rememberDirectivesForIp,
+  resolveClientIp,
   resolveConfig,
   resolveReasoningStyle,
   stripSessionTokensFromText,

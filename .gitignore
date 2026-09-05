@@ -1,0 +1,15 @@
+# Wrangler / Cloudflare local state (contains account info)
+.wrangler/
+.dev.vars
+*.dev.vars
+
+# Dependencies
+node_modules/
+
+# Environment / secrets
+.env
+.env.*
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

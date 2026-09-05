@@ -1,0 +1,17 @@
+{
+  "name": "cloudflare-relay-and-retrier",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Single-file Cloudflare Worker that relays AI API requests to any provider chosen with in-prompt directives, with aggressive retrying and transparent streaming.",
+  "main": "worker.js",
+  "scripts": {
+    "dev": "node dev-server.mjs",
+    "test": "node --test tests/",
+    "test:unit": "node --test tests/unit.test.mjs",
+    "test:integration": "node --test tests/integration.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

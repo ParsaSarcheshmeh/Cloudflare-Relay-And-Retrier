@@ -1,0 +1,29 @@
+name = "ai-relay"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# Optional per-deployment overrides. Every one of these is read by resolveConfig()
+# in worker.js; delete the block to keep the built-in defaults.
+[vars]
+# RELAY_DEFAULT_PROVIDER = "https://api.example.com/v1"
+# RELAY_PROVIDER_ALLOWLIST = "api.openai.com,*.openai.azure.com"
+# RELAY_MAX_ATTEMPTS = "10000"
+# RELAY_BASE_DELAY_MS = "250"
+# RELAY_MAX_DELAY_MS = "30000"
+# RELAY_ATTEMPT_TIMEOUT_MS = "120000"
+# RELAY_RETRY_BUDGET_MS = "0"
+# RELAY_CORS_ORIGIN = "*"
+# RELAY_DEBUG = "false"
+# RELAY_ALLOW_HTTP = "false"
+# Sticky sessions (subagents & compaction). Set a secret to encrypt tokens.
+# RELAY_SESSION_SECRET = "change-me-to-a-long-random-string"
+# RELAY_SESSION_TTL_SECONDS = "604800"
+# RELAY_SESSIONS = "true"
+# RELAY_SESSION_INCLUDE_KEY = "true"
+# Path-based providers: /openai/v1/... routes to https://api.openai.com/v1/...
+# RELAY_NAMED_PROVIDERS = "openai=https://api.openai.com/v1, anthropic=https://api.anthropic.com"
+# Reasoning effort mapping: style auto-detects from compatibility + upstream host.
+# RELAY_REASONING = "true"
+# RELAY_REASONING_STYLE = "auto"            # effort|responses|anthropic|gemini|openrouter|glm|off
+# RELAY_REASONING_ANTHROPIC_MODE = "auto"   # auto|budget|adaptive
+# RELAY_REASONING_GEMINI_FIELD = "thinkingBudget"  # or thinkingLevel

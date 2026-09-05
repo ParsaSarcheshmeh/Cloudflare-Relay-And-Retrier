@@ -94,7 +94,7 @@ request (other IP):  ← inherits nothing
 model: "glm-5.3-flash@https://api.b.ai/v1@key=sk-x"
 ```
 
-Each `@`-separated flag is one of: an `http(s)` URL or bare host (provider), a `RELAY_NAMED_PROVIDERS` name, `key=…`/`apikey=…`/`k=…`, or `compatibility=…`/`compat=…`/`c=…`. The provider receives the **clean** model name; any unrecognized segment (e.g. `weird@name`) leaves the string untouched, so ordinary model names containing `@` are never mangled. Flags also stick to the IP afterwards, and `[model=…]` text directives keep first-wins priority over them.
+Each `@`-separated flag is one of: an `http(s)` URL or bare host (provider), a `RELAY_NAMED_PROVIDERS` name, `key=…`/`apikey=…`/`k=…`, `compatibility=…`/`compat=…`/`c=…`, or `reasoning=…`/`effort=…`/`thinking=…` (any level, alias, or token budget — e.g. `model@provider@key=sk-x@reasoning=max`). The provider receives the **clean** model name; any unrecognized segment (e.g. `weird@name`) leaves the string untouched, so ordinary model names containing `@` are never mangled. Flags also stick to the IP afterwards, and `[model=…]` text directives keep first-wins priority over them.
 
 ### Sticky sessions: the subagent & compaction problem
 
@@ -348,7 +348,7 @@ RELAY_ALLOW_PRIVATE_NETWORKS = "true"
 ### Tests
 
 ```bash
-npm test    # 184 tests: unit (57) + reasoning (26) + sessions (11) + ip-memory (15) + integration (75)
+npm test    # 186 tests: unit (57) + reasoning (26) + sessions (11) + ip-memory (17) + integration (75)
 ```
 
 Two local-run behaviours worth knowing:

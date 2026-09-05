@@ -840,7 +840,13 @@ function extractModelFlags(modelString, cfg) {
   if (at <= 0 || at === modelString.length - 1) return null;
 
   const model = modelString.slice(0, at).trim();
-  const flags = { model: model === "" ? null : model, provider: undefined, apiKey: undefined, compatibility: undefined };
+  const flags = {
+    model: model === "" ? null : model,
+    provider: undefined,
+    apiKey: undefined,
+    compatibility: undefined,
+    reasoning: undefined,
+  };
   let matchedAny = false;
 
   for (const rawSegment of modelString.slice(at + 1).split("@")) {
@@ -875,6 +881,14 @@ function extractModelFlags(modelString, cfg) {
       const compatibility = normalizeCompatibility(compatMatch[1]);
       if (!compatibility) return null;
       flags.compatibility ??= compatibility;
+      matchedAny = true;
+      continue;
+    }
+    const reasoningMatch = segment.match(/^(?:reasoning|reasoning_effort|reasoningeffort|effort|thinking)=(.+)$/i);
+    if (reasoningMatch) {
+      const reasoning = parseReasoningValue(reasoningMatch[1]);
+      if (!reasoning) return null;
+      flags.reasoning ??= reasoning;
       matchedAny = true;
       continue;
     }
@@ -3490,6 +3504,10 @@ async function handleRelay(request, env) {
       if (flags.compatibility !== undefined && state.values.compatibility === undefined) {
         state.values.compatibility = flags.compatibility;
         state.sources.compatibility = "model-flag";
+      }
+      if (flags.reasoning !== undefined && state.values.reasoning === undefined) {
+        state.values.reasoning = flags.reasoning;
+        state.sources.reasoning = "model-flag";
       }
       // The cleaned name replaces the operative model string only — never a
       // directive-chosen model from a different source.

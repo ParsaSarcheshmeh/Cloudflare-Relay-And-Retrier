@@ -928,6 +928,19 @@ test("REGRESSION: routing flags inside the model name configure the request", as
   assert.equal(followUp.response.status, 400, "the flags came from the body model, not from an IP that sent them");
 });
 
+test("REGRESSION: the full model-flag chain including reasoning reaches the provider", async () => {
+  // The exact pattern reported failing: provider + key + reasoning as model flags.
+  const { response, json } = await postJson("/v1/chat/completions", {
+    model: `glm-5.3-flash@${origin}/v1@key=FLAG-KEY@reasoning=max`,
+    messages: [{ role: "user", content: "hi" }],
+  }, { headers: ip("198.51.100.120") });
+  assert.equal(response.status, 200);
+  assert.equal(json.received.model, "glm-5.3-flash", "the provider must get the clean model name");
+  assert.equal(json.authorization, "Bearer FLAG-KEY");
+  assert.equal(json.received.reasoning_effort, "max");
+  assert.equal(JSON.stringify(json.received).includes("@"), false, "no flag residue may reach the provider");
+});
+
 test("model flags with a named provider and compatibility", async () => {
   const env = { ...ENV, RELAY_NAMED_PROVIDERS: `mock=${origin}/v1` };
   const { json } = await postJson("/v1/chat/completions", {

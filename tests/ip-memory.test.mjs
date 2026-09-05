@@ -43,6 +43,7 @@ test("model@url extracts model and provider", () => {
     provider: "https://api.b.ai/v1",
     apiKey: undefined,
     compatibility: undefined,
+    reasoning: undefined,
   });
 });
 
@@ -52,18 +53,40 @@ test("model@bare-host prepends https://", () => {
     provider: "https://api.b.ai/v1",
     apiKey: undefined,
     compatibility: undefined,
+    reasoning: undefined,
   });
 });
 
 test("model@provider@key=... chains multiple flags; first of a kind wins", () => {
   assert.deepEqual(
     extractModelFlags("glm-5.3-flash@https://api.b.ai/v1@key=sk-first@k=sk-second", cfg),
-    { model: "glm-5.3-flash", provider: "https://api.b.ai/v1", apiKey: "sk-first", compatibility: undefined },
+    { model: "glm-5.3-flash", provider: "https://api.b.ai/v1", apiKey: "sk-first", compatibility: undefined, reasoning: undefined },
   );
   assert.deepEqual(
     extractModelFlags("m@api.b.ai@apikey=abc@c=anthropic", cfg),
-    { model: "m", provider: "https://api.b.ai", apiKey: "abc", compatibility: "anthropic" },
+    { model: "m", provider: "https://api.b.ai", apiKey: "abc", compatibility: "anthropic", reasoning: undefined },
   );
+});
+
+test("REGRESSION: reasoning is a valid model flag, including levels, budgets and aliases", () => {
+  assert.deepEqual(
+    extractModelFlags("glm-5.3-flash@https://api.b.ai/v1@key=sk-x@reasoning=max", cfg),
+    { model: "glm-5.3-flash", provider: "https://api.b.ai/v1", apiKey: "sk-x", compatibility: undefined, reasoning: { level: "max" } },
+  );
+  assert.deepEqual(
+    extractModelFlags("m@api.b.ai@reasoning=8192", cfg).reasoning,
+    { budget: 8192 },
+  );
+  assert.deepEqual(
+    extractModelFlags("m@api.b.ai@effort=low", cfg).reasoning,
+    { level: "low" },
+  );
+  assert.deepEqual(
+    extractModelFlags("m@api.b.ai@thinking=off", cfg).reasoning,
+    { level: "none" },
+  );
+  // An invalid reasoning value voids the whole extraction, like compatibility.
+  assert.equal(extractModelFlags("m@api.b.ai@reasoning=whenever", cfg), null);
 });
 
 test("named providers work as model flags", () => {
@@ -72,6 +95,7 @@ test("named providers work as model flags", () => {
     provider: "https://api.b.ai/v1",
     apiKey: undefined,
     compatibility: undefined,
+    reasoning: undefined,
   });
 });
 

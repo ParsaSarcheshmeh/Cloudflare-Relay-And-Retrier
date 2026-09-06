@@ -35,8 +35,10 @@ That's the whole idea: the relay finds the directives, removes them from the tex
 **3 — Or keep it local.** Any OpenAI-compatible server (Ollama, LM Studio, …) works too:
 
 ```bash
-node dev-server.mjs   # http://localhost:8787  (just Node, nothing to install)
+npm run dev           # → http://localhost:8787   (just Node, nothing to install)
 ```
+
+No Cloudflare account at all? The [local-only deploy guide](#local-only-deploy-guide) below walks through it — including the automatic port fallback.
 
 ```bash
 curl http://localhost:8787/v1/chat/completions \
@@ -67,11 +69,64 @@ curl https://myworker.example.workers.dev/v1/chat/completions \
 
 Upstream receives `messages[0].content = "سلام! Explain quantum computing"`, model `gpt-5`, `Authorization: Bearer sk-xxx`.
 
+## Local-only deploy guide
+
+You can run the relay entirely on your own machine — no Cloudflare account, no deploy, no `npm install`. It is the same `worker.js`, served by the zero-dependency dev server.
+
+### 1 — Requirements and files
+
+- **Node 20+** (`node -v` to check) — the only requirement.
+- Get the files: `git clone https://github.com/ParsaSarcheshmeh/Cloudflare-Relay-And-Retrier.git`, or just put `worker.js`, `dev-server.mjs` and `package.json` in one folder.
+- Nothing to install — the dev server uses only Node built-ins.
+
+### 2 — Start it
+
+```bash
+npm run dev
+```
+
+(or `node dev-server.mjs`). You should see:
+
+```
+AI relay dev server ready on http://localhost:8787
+  GET  /__relay/health   health check
+  GET  /                 usage document
+  POST /v1/chat/completions   (or any provider path)
+  env: RELAY_ALLOW_HTTP=true RELAY_ALLOW_PRIVATE_NETWORKS=true (dev defaults)
+```
+
+### 3 — Busy port? It falls back automatically
+
+If 8787 is already taken (a leftover `wrangler dev`/`workerd` likes to sit there), the server names the process holding it and moves to the next free port — up to 25 consecutive tries:
+
+```
+port 8787 is already in use by workerd (pid 4242) — falling back to 8788...
+AI relay dev server ready on http://localhost:8788
+  (requested port 8787 was busy)
+```
+
+Whatever port the banner prints is the one to use. Pin one explicitly with `PORT=9000 npm run dev` (or `node dev-server.mjs --port 9000`).
+
+### 4 — Point your tools at it
+
+The base URL is `http://localhost:<port>`, and every provider path works as-is (`/v1/chat/completions`, `/v1/messages`, …). Any OpenAI SDK or agent framework needs only the base URL changed — `OPENAI_BASE_URL=http://localhost:8787/v1` — with routing directives travelling in the prompt as always. Each request is logged with method, path, status and duration.
+
+### Local vs Cloudflare — what differs
+
+- **Same `worker.js`**: the dev server adapts Node's HTTP server to the Worker API, so behaviour matches what you'd deploy.
+- **Dev-friendly SSRF defaults**: `RELAY_ALLOW_HTTP=true` and `RELAY_ALLOW_PRIVATE_NETWORKS=true`, so `[provider=http://127.0.0.1:11434/v1]` (Ollama, LM Studio, …) works. Set both to `"false"` to rehearse production's SSRF behaviour.
+- **Other `RELAY_*` variables pass through** from your shell — e.g. `RELAY_DEBUG=true npm run dev`.
+- **Client IP**: `cf-connecting-ip` is simulated from the socket; send your own `cf-connecting-ip` header to simulate several callers (each gets its own IP memory).
+- **Failure semantics**: a hostname that does not resolve (typo) fails fast with `502 upstream_error / dns_not_found`. A host that *refuses connections* (service down) is retried indefinitely by design — cap it with `[timeout=…]` in the prompt or `RELAY_ATTEMPT_TIMEOUT_MS`.
+- **No platform ceilings**: the 50/1000 subrequest budget, ~10 ms CPU and 128 MB isolate limits are Cloudflare-side; locally you are bounded only by your own machine.
+
+That's the whole deployment. When you want the real runtime instead — `workerd`, genuine subrequest limits, abort signals, WebSocket handling — see **wrangler dev** under Advanced.
+
 ---
 
 # ⚙️ Advanced
 
-Everything below is optional — the defaults are sensible and the quick start above is the full setup. Read on when you want more control.
+Everything below is optional — the quick start (and the local-only deploy guide) above is the full setup. Read on when you want more control.
 
 ## Directives reference
 
@@ -351,20 +406,9 @@ Everything in `BASE_CONFIG` can be overridden with plain-text Worker variables (
 
 </details>
 
-## Run it locally
+## Closer to production: wrangler dev
 
-Two options:
-
-### Option A — zero-install dev server (just Node)
-
-```bash
-node dev-server.mjs            # or: npm run dev  →  http://localhost:8787
-PORT=9000 node dev-server.mjs  # custom port (also: --port 9000)
-```
-
-`dev-server.mjs` adapts Node's HTTP server to the Worker API, so the **same `worker.js` that deploys to Cloudflare** runs on your machine. For convenience it defaults `RELAY_ALLOW_HTTP=true` and `RELAY_ALLOW_PRIVATE_NETWORKS=true` so you can point `[provider=…]` at a localhost service (e.g. Ollama, LM Studio, or any OpenAI-compatible server) — set those env vars to `false` to rehearse production's SSRF behaviour. Every request is logged with status and duration.
-
-### Option B — wrangler dev (closest to production)
+The [local-only deploy guide](#local-only-deploy-guide) covers everyday local use with the zero-install dev server. For the most faithful local environment — the real `workerd` runtime, request abort signals, subrequest budget errors, streaming behaviour, WebSocket handling — use wrangler:
 
 ```bash
 npx wrangler dev     # uses wrangler.toml; serves on http://localhost:8787
@@ -378,18 +422,13 @@ RELAY_ALLOW_HTTP = "true"
 RELAY_ALLOW_PRIVATE_NETWORKS = "true"
 ```
 
-> Note: `wrangler dev` binds port 8787 by default. If something else already listens there, use `wrangler dev --port 8790` (and `PORT=8790` for the dev server).
+> Note: `wrangler dev` binds port 8787 by default. If something else already listens there, use `wrangler dev --port 8790` (the zero-install dev server falls back on its own).
 
 ### Tests
 
 ```bash
 npm test    # 186 tests: unit (57) + reasoning (26) + sessions (11) + ip-memory (17) + integration (75)
 ```
-
-Two local-run behaviours worth knowing:
-
-- **Busy ports are handled**: if 8787 is taken (e.g. by one of your other `wrangler dev` sessions), the dev server tells you which process holds it and automatically falls back to the next free port. Override any time with `PORT=…` / `--port`.
-- **Failure semantics differ**: a hostname that does not resolve (typo) fails fast with `502 upstream_error / dns_not_found`. A host that *refuses connections* (service down) is still retried indefinitely by design — point `[timeout=…]` at the prompt or set `RELAY_ATTEMPT_TIMEOUT_MS` while developing against something that may not be up.
 
 The suite covers all 15 spec scenarios (first-wins parsing, unicode, vision/video preservation, TTS binary, multipart STT, SSE streaming latency, 429-retry, 401 passthrough, SSRF rejections, malformed providers) plus regressions for every finding from three independent reviews (CPU-bounded scanning, prototype pollution, redirect credential stripping, capped body reads, allowlist ordering, Set-Cookie/Content-Encoding passthrough, and more).
 

@@ -47,7 +47,7 @@ Explain this image in detail.
 </div>
 
 ```bash
-node dev-server.mjs   # http://localhost:8787  (فقط Node، چیزی برای نصب نیست)
+npm run dev           # → http://localhost:8787   (فقط Node، چیزی برای نصب نیست)
 ```
 
 ```bash
@@ -85,11 +85,84 @@ curl https://myworker.example.workers.dev/v1/chat/completions \
 
 در بالادست این دریافت می‌شود: `messages[0].content = "سلام! Explain quantum computing"`، مدل `gpt-5` و هدر `Authorization: Bearer sk-xxx`.
 
+اصلاً حساب Cloudflare ندارید؟ [راهنمای دیپلوی کاملاً لوکال](#deploy-local) همین پایین قدم‌به‌قدم همه‌چیز را می‌گوید — از جمله فالبکِ خودکار پورت.
+
+</div>
+
+<a id="deploy-local"></a>
+
+<div dir="rtl">
+
+## دیپلوی کاملاً لوکال (بدون Cloudflare)
+
+می‌توانید رله را کاملاً روی سیستم خودتان اجرا کنید — بدون حساب Cloudflare، بدون دیپلوی، بدون `npm install`. همان `worker.js` است که این‌بار توسط سرور توسعهٔ بدون‌وابستگی سرو می‌شود.
+
+### ۱ — پیش‌نیازها و فایل‌ها
+
+- **Node نسخهٔ ۲۰ به بالا** (با `node -v` چک کنید) — تنها پیش‌نیاز.
+- فایل‌ها را بگیرید: `git clone https://github.com/ParsaSarcheshmeh/Cloudflare-Relay-And-Retrier.git`، یا فقط `worker.js`، `dev-server.mjs` و `package.json` را در یک پوشه بگذارید.
+- چیزی برای نصب نیست — سرور توسعه فقط از ماژول‌های داخلی Node استفاده می‌کند.
+
+### ۲ — سرور را روشن کنید
+
+</div>
+
+```bash
+npm run dev
+```
+
+<div dir="rtl">
+
+(یا `node dev-server.mjs`). باید این را ببینید:
+
+</div>
+
+```
+AI relay dev server ready on http://localhost:8787
+  GET  /__relay/health   health check
+  GET  /                 usage document
+  POST /v1/chat/completions   (or any provider path)
+  env: RELAY_ALLOW_HTTP=true RELAY_ALLOW_PRIVATE_NETWORKS=true (dev defaults)
+```
+
+<div dir="rtl">
+
+### ۳ — پورت اشغال بود؟ خودکار جابه‌جا می‌شود
+
+اگر 8787 قبلاً گرفته شده باشد (یک `wrangler dev`/`workerd` جا‌مانده دوست دارد آن‌جا بنشیند)، سرور می‌گوید کدام پروسه نگهش داشته و می‌رود سراغ اولین پورت آزاد بعدی — تا ۲۵ پورت متوالی:
+
+</div>
+
+```
+port 8787 is already in use by workerd (pid 4242) — falling back to 8788...
+AI relay dev server ready on http://localhost:8788
+  (requested port 8787 was busy)
+```
+
+<div dir="rtl">
+
+هر پورتی که بنر چاپ می‌کند همان است که باید استفاده کنید. هر وقت خواستید پورت را ثابت کنید: `PORT=9000 npm run dev` (یا `node dev-server.mjs --port 9000`).
+
+### ۴ — ابزارهایتان را به آن وصل کنید
+
+آدرس پایه `http://localhost:<port>` است و هر مسیر سرویس‌دهنده عیناً کار می‌کند (`/v1/chat/completions`، `/v1/messages`، …). هر SDK سازگار با OpenAI یا فریم‌ورک ایجنتی فقط تغییر base URL می‌خواهد — `OPENAI_BASE_URL=http://localhost:8787/v1` — و دایرکتیوهای مسیریابی مثل همیشه داخل پرامپت سفر می‌کنند. هر درخواست هم با متد، مسیر، وضعیت و مدت‌زمان لاگ می‌شود.
+
+### تفاوت‌های لوکال با Cloudflare
+
+- **همان `worker.js`**: سرور توسعه سرور HTTP نود را به API ورکر وفق می‌دهد، پس رفتار با چیزی که دیپلوی می‌کنید یکسان است.
+- **پیش‌فرض‌های SSRF دوستانهٔ توسعه**: `RELAY_ALLOW_HTTP=true` و `RELAY_ALLOW_PRIVATE_NETWORKS=true`، پس `[provider=http://127.0.0.1:11434/v1]` (Ollama، LM Studio، …) کار می‌کند. برای تمرین رفتار SSRF عملیات هر دو را `"false"` کنید.
+- **بقیهٔ متغیرهای `RELAY_*` از شل شما عبور می‌کنند** — مثلاً `RELAY_DEBUG=true npm run dev`.
+- **IP کلاینت**: `cf-connecting-ip` از سوکت شبیه‌سازی می‌شود؛ برای شبیه‌سازی چند صداکننده (هر کدام حافظهٔ IP خودشان) هدر `cf-connecting-ip` دلخواه خودتان را بفرستید.
+- **معنای شکست**: هاستی که resolve نمی‌شود (غلط تایپی) سریع با `502 upstream_error / dns_not_found` می‌بازد. هاستی که *اتصال را رد می‌کند* (سرویس پایین است) طبق طراحی تا بی‌نهایت retry می‌شود — با `[timeout=…]` در پرامپت یا `RELAY_ATTEMPT_TIMEOUT_MS` سقفش کنید.
+- **بدون سقف‌های پلتفرم**: بودجهٔ subrequest یا 50/1000، حدود ۱۰ میلی‌ثانیه CPU و محدودیت ۱۲۸ مگابایتی ایزولیت، همه مال Cloudflare است؛ لوکال فقط به سیستم خودتان محدودید.
+
+کل دیپلوی همین بود. هر وقت ران‌تایم واقعی را خواستید — `workerd`، سقف‌های واقعی subrequest، سیگنال‌های قطع، هندل WebSocket — بخش **wrangler dev** در پیشرفته را ببینید.
+
 ---
 
 # ⚙️ پیشرفته
 
-همه‌چیزِ پایین اختیاری است — پیش‌فرض‌ها معقول‌اند و «شروع سریع» بالاتر، کل راه‌اندازی بود. هر وقت کنترل بیشتری خواستید ادامه دهید.
+همه‌چیزِ پایین اختیاری است — «شروع سریع» و «راهنمای دیپلوی کاملاً لوکال» بالاتر، کل راه‌اندازی‌اند. هر وقت کنترل بیشتری خواستید ادامه دهید.
 
 ## مرجع دایرکتیوها
 
@@ -410,24 +483,9 @@ curl https://myworker.example.workers.dev/v1/audio/transcriptions \
 
 </details>
 
-## اجرای لوکال
+## نزدیک‌تر به عملیات: wrangler dev
 
-دو راه دارید:
-
-### گزینهٔ A — سرور توسعهٔ بدون نصب (فقط Node)
-
-</div>
-
-```bash
-node dev-server.mjs            # یا: npm run dev  →  http://localhost:8787
-PORT=9000 node dev-server.mjs  # پورت دلخواه (همچنین: --port 9000)
-```
-
-<div dir="rtl">
-
-`dev-server.mjs` سرور HTTP نود را به API ورکر وفق می‌دهد؛ پس **همان `worker.js` که روی Cloudflare دیپلوی می‌شود** روی سیستم شما هم اجرا می‌شود. برای راحتی، پیش‌فرضش `RELAY_ALLOW_HTTP=true` و `RELAY_ALLOW_PRIVATE_NETWORKS=true` است تا بتوانید `[provider=…]` را به یک سرویس لوکال بزنید (مثل Ollama، LM Studio یا هر سرور سازگار با OpenAI) — این متغیرها را `false` کنید تا رفتار SSRF عملیات را هم تمرین کنید. هر درخواست با وضعیت و مدت‌زمان لاگ می‌شود.
-
-### گزینهٔ B — wrangler dev (نزدیک‌ترین به عملیات)
+[راهنمای دیپلوی کاملاً لوکال](#deploy-local) استفادهٔ روزمرهٔ لوکال با سرور توسعهٔ بدون‌نصب را پوشش می‌دهد. برای وفادارترین محیط لوکال — ران‌تایم واقعی `workerd`، سیگنال‌های قطع درخواست، خطاهای بودجهٔ subrequest، رفتار استریم، هندل WebSocket — از wrangler استفاده کنید:
 
 </div>
 
@@ -449,7 +507,7 @@ RELAY_ALLOW_PRIVATE_NETWORKS = "true"
 
 <div dir="rtl">
 
-> نکته: `wrangler dev` به‌صورت پیش‌فرض پورت 8787 را می‌بندد. اگر چیز دیگری آن‌جاست، `wrangler dev --port 8790` را بزنید (و `PORT=8790` برای سرور توسعه).
+> نکته: `wrangler dev` به‌صورت پیش‌فرض پورت 8787 را می‌بندد. اگر چیز دیگری آن‌جاست، `wrangler dev --port 8790` را بزنید (سرور توسعهٔ بدون‌نصب خودش فالبک می‌شود).
 
 ### تست‌ها
 
@@ -460,11 +518,6 @@ npm test    # 186 تست: unit (57) + reasoning (26) + sessions (11) + ip-memory
 ```
 
 <div dir="rtl">
-
-دو رفتار لوکال ارزش دانستن دارد:
-
-- **پورت‌های اشغال هندل می‌شوند**: اگر 8787 گرفته شده (مثلاً توسط یکی از `wrangler dev`های دیگرتان)، سرور توسعه می‌گوید کدام پروسه نگهش داشته و خودکار به اولین پورت آزاد می‌رود. هر وقت خواستید با `PORT=…` / `--port` بازنویسی کنید.
-- **معنای شکست فرق دارد**: هاستی که resolve نمی‌شود (غلط تایپی) سریع با `502 upstream_error / dns_not_found` می‌بازد. هاستی که *اتصال را رد می‌کند* (سرویس پایین است) طبق طراحی تا بی‌نهایت retry می‌شود — در حین توسعهٔ روی چیزی که ممکن است بالا نباشد، `[timeout=…]` را به پرامپت بدهید یا `RELAY_ATTEMPT_TIMEOUT_MS` را ست کنید.
 
 مجموعهٔ تست همهٔ ۱۵ سناریوی spec را پوشش می‌دهد (پارس اولین-برنده، یونیکد، حفظ vision/video، باینری TTS، STT چندبخشی، تأخیر استریم SSE، retry روی 429، عبور مستقیم 401، ردشدن‌های SSRF، سرویس‌دهنده‌های بدشکل) به‌علاوهٔ رگرسیون‌های همهٔ یافته‌های سه بازبینی مستقل (اسکنِ محدود به CPU، آلودگی prototype، درآوردن credential در ریدایرکت، سقف خواندن بدنه، ترتیب لیست مجاز، عبور Set-Cookie/Content-Encoding و موارد دیگر).
 

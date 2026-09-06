@@ -1,5 +1,7 @@
 # Cloudflare Workers AI Relay & Retrier
 
+**English** · [فارسی](README.fa.md)
+
 A **single-file Cloudflare Worker** (`worker.js`) that relays AI API requests to any provider you name inside your prompt — OpenAI, Anthropic, OpenAI-compatible gateways, Gemini, Azure, image/video/audio endpoints — with aggressive retrying and fully transparent streaming.
 
 Paste `worker.js` into the Cloudflare dashboard editor and deploy. No npm packages, no build step, no Node built-ins.
@@ -12,29 +14,66 @@ client ──► Worker (parse directives → strip them → rewrite model/auth/
              └─◄── provider response streamed straight back (SSE/binary/JSON)
 ```
 
-## How it works
+## 🚀 Quick start
 
-Call the Worker exactly like the provider endpoint, and embed directives in your prompt text:
+**1 — Deploy (2 minutes).** Cloudflare dashboard → **Workers & Pages** → **Create Worker** → **Edit code** → delete the scaffold, paste the entire contents of `worker.js` → **Deploy**. Your relay is live at `https://<worker-name>.<account>.workers.dev`. Check `GET /__relay/health` — it should return `{"ok":true,…}`.
+
+*(Prefer the CLI? `npm i -g wrangler && wrangler deploy` in this folder — `wrangler.toml` is included.)*
+
+**2 — Use it.** Call the Worker exactly like the provider endpoint, and put directives inside your prompt text:
 
 ```text
 Explain this image in detail.
 
 [provider=https://api.example.com/v1]
 [model=gpt-5]
-[compatibility=responses]
 [key=sk-example]
 ```
 
-The relay finds the directives, removes them from the text the model sees, forces `model` in the outgoing JSON, switches the auth header style to match the compatibility, and proxies everything else byte-for-byte.
+That's the whole idea: the relay finds the directives, removes them from the text the model sees, forces `model` in the outgoing JSON, switches the auth header style to match the provider, and streams the answer straight back. Everything else — images, files, tool definitions — passes through byte-for-byte.
 
-### Rules
+**3 — Or keep it local.** Any OpenAI-compatible server (Ollama, LM Studio, …) works too:
 
-- **First occurrence wins.** `hello [model=N] idk [model=G]` → model `N`. Later duplicates are ignored but still removed from the text. This applies independently per directive and across the whole document (all messages, in order).
-- **Only recognized directives are removed.** Unknown `[bracket]` text, Markdown links (`[key=value](https://…)` is left alone), JSON and code in your prompt are untouched.
-- **Unicode is never normalized.** Persian, Arabic, CJK, emoji, combining marks and RTL text survive the round trip byte-for-byte (`سلام دنیا 😄 [model=gpt-test]` works).
-- **Streaming is never buffered**, and nothing is retried once a response has started flowing to the client.
+```bash
+node dev-server.mjs   # http://localhost:8787  (just Node, nothing to install)
+```
 
-### Directives
+```bash
+curl http://localhost:8787/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"سلام! [provider=http://127.0.0.1:11434/v1] [model=llama3.1]"}]}'
+```
+
+### The 30-second mental model
+
+- Directives look like `[name=value]` and can sit anywhere in your prompt. **First occurrence wins**; later duplicates are ignored but still cleaned out of the text. Unknown `[brackets]`, Markdown links, JSON and code in your prompt are left alone.
+- Unicode is never normalized — Persian, Arabic, CJK, emoji and RTL text survive the round trip byte-for-byte (`سلام دنیا 😄 [model=gpt-test]` works).
+- Retries are automatic: `408 425 429 500 502 503 504 507 509 520-527 529 530` and network failures get exponential backoff; hard errors like `401` come back to you verbatim, unmodified.
+- Streaming is never buffered, and nothing is retried once a response has started flowing to you.
+- `[key=…]` never reaches the model text, error responses, or logs. Omit it entirely for free providers — no auth header is sent at all.
+
+A full request looks exactly like a normal OpenAI call:
+
+```bash
+curl https://myworker.example.workers.dev/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{
+      "role": "user",
+      "content": "سلام! Explain quantum computing [provider=https://api.provider.com/v1] [model=gpt-5] [key=sk-xxx]"
+    }]
+  }'
+```
+
+Upstream receives `messages[0].content = "سلام! Explain quantum computing"`, model `gpt-5`, `Authorization: Bearer sk-xxx`.
+
+---
+
+# ⚙️ Advanced
+
+Everything below is optional — the defaults are sensible and the quick start above is the full setup. Read on when you want more control.
+
+## Directives reference
 
 | Directive | Aliases | Effect |
 |---|---|---|
@@ -53,7 +92,7 @@ Directive values cannot contain `]`; names are case-insensitive (`[MODEL=x]`), v
 
 **Where directives are looked for** (first source wins): the request body text → query parameters (`?provider=…&key=…&model=…`) → `X-Relay-*` headers (`X-Relay-Provider`, `X-Relay-Model`, `X-Relay-Key`, …). Query/header directives exist so binary uploads (STT audio with no text field) can still choose a provider.
 
-### Reasoning effort
+## Reasoning effort
 
 Every provider spells "think harder" differently, so `[reasoning=…]` carries **intent** and the relay writes it into whichever field the target API actually accepts. Values: `none` (off) · `minimal` · `low` · `medium` · `high` · `xhigh` · `max` · `default` (leave the provider's own default alone) · an explicit token budget like `[reasoning=8192]`. Aliases for the directive name: `reasoning_effort`, `effort`, `thinking`; values accept the obvious synonyms (`off`/`false`, `min`, `med`, `x-high`, `ultra`, `on`).
 
@@ -71,11 +110,13 @@ The numeric rules are enforced, not guessed: Claude's `budget_tokens` is derived
 
 Reasoning effort also travels in session tokens, so subagents inherit it (see below). Override the auto-detection with `RELAY_REASONING_STYLE` (`effort`/`responses`/`anthropic`/`gemini`/`openrouter`/`glm`/`off`), pick Claude's shape with `RELAY_REASONING_ANTHROPIC_MODE` (`auto`/`budget`/`adaptive`), or turn the whole feature off with `RELAY_REASONING=false`.
 
-### IP memory + model-name flags: zero-cooperation stickiness
+## Routing that needs no cooperation from the client
 
-Session tokens need the client to echo them. Two more mechanisms remove even that requirement:
+In-prompt directives only exist in text the **user** wrote. The relay adds three mechanisms so routing survives even when no one echoes anything:
 
-**IP memory.** When a request resolves directives, the relay remembers them for the caller's IP (24 h sliding TTL). Later requests from the same IP with *no* directives — subagents, post-compaction turns — inherit provider, model, compatibility, reasoning effort and key automatically:
+### IP memory
+
+When a request resolves directives, the relay remembers them for the caller's IP (24 h sliding TTL). Later requests from the same IP with *no* directives — subagents, post-compaction turns — inherit provider, model, compatibility, reasoning effort and key automatically:
 
 ```
 request 1 (your IP): "hello [provider=https://api.b.ai/v1] [model=glm-5.3-flash] [key=sk-x] [reasoning=max]"
@@ -88,7 +129,9 @@ request (other IP):  ← inherits nothing
 - Scope: the memory is per-isolate. The bundled dev server (one process) is authoritative; on Cloudflare it is best-effort — most requests hit a warm isolate, but for a hard guarantee echo the stateless session token.
 - Caveat: everyone behind one public IP (office NAT, VPN) shares a routing slot. Disable with `RELAY_IP_MEMORY=false`.
 
-**Model-name flags.** Clients that can only set a model string (no prompt, no headers) can embed routing in it:
+### Model-name flags
+
+Clients that can only set a model string (no prompt, no headers) can embed routing in it:
 
 ```
 model: "glm-5.3-flash@https://api.b.ai/v1@key=sk-x"
@@ -98,7 +141,7 @@ Each `@`-separated flag is one of: an `http(s)` URL or bare host (provider), a `
 
 ### Sticky sessions: the subagent & compaction problem
 
-In-prompt directives only exist in text the **user** wrote. Two common situations break that:
+Two common situations break in-prompt directives:
 
 - **Subagents**: when an AI agent spawns a subagent, the *parent model* writes the subagent's prompt — and doesn't copy `[provider=…] [key=…]` into it. The subagent's API calls hit the relay with no routing at all.
 - **Compaction**: long conversations get summarized; the model-written summary may drop the directives.
@@ -123,7 +166,7 @@ RELAY_NAMED_PROVIDERS = "openai=https://api.openai.com/v1, anthropic=https://api
 
 Then point your agent harness (and every subagent it spawns) at `https://<worker>/openai` as the base URL with your provider key as the API key — routing works for every request regardless of model behavior, compaction, or prompt rewrites. `?provider=openai` and `[provider=openai]` also expand through the same mapping.
 
-### Endpoints and paths
+## Endpoints and paths
 
 The upstream URL is `provider_base` + incoming path, joined without ever producing `/v1/v1/…`:
 
@@ -136,7 +179,7 @@ The upstream URL is `provider_base` + incoming path, joined without ever produci
 
 Query strings are preserved (`/v1/models?limit=100` keeps `?limit=100`). Any unknown path is proxyable as-is. `GET /` returns a usage document; `GET /__relay/health` is a health check.
 
-### Retry system
+## Retry system
 
 Retries on `408 425 429 500 502 503 504 507 509 520-527 529 530` and on fetch-level failures (DNS, connection resets, timeouts — including the relay's own per-attempt timeout). Does **not** retry `400 401 403 404 405 409 413 415 422` — those are returned to you verbatim.
 
@@ -147,24 +190,11 @@ Retries on `408 425 429 500 502 503 504 507 509 520-527 529 530` and on fetch-le
 - Client disconnects abort the loop immediately.
 - Redirects are followed by the relay itself (max 3, configurable) so **every hop is re-checked against the SSRF policy**; cross-origin hops drop credentials, like standard fetch.
 
-### Transparent by design
+## Transparent by design
 
 Only text fields are scanned and rewritten (`prompt`, `text`, `input`, `content`, `query`, `messages`, …). These are **never** touched or even parsed further: `url`, `image_url`, `video_url`, `base64`, `data`, `bytes`, `file(s)`, `attachments`, `media`, `tools`, `response_format`, `api_key`, `authorization`, … — so vision payloads, provider-specific video schemas, tool definitions and unknown extensions all reach the provider exactly as you sent them. Multipart uploads are rebuilt only when a directive actually changed a text field (letting `fetch` regenerate the boundary); small binary bodies are buffered for retryability; anything bigger is streamed through in a single attempt.
 
-## Examples
-
-### Chat Completions
-```bash
-curl https://myworker.example.workers.dev/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [{
-      "role": "user",
-      "content": "سلام! Explain quantum computing [provider=https://api.provider.com/v1] [model=gpt-5] [key=sk-xxx]"
-    }]
-  }'
-```
-Upstream receives `messages[0].content = "سلام! Explain quantum computing"`, model `gpt-5`, `Authorization: Bearer sk-xxx`.
+## More examples
 
 ### Responses API
 ```bash
@@ -219,7 +249,8 @@ curl https://myworker.example.workers.dev/v1/audio/transcriptions \
 ```
 Binary providers without a text field can use query directives: `POST /v1/audio/transcriptions?provider=https://…&key=…`.
 
-### Parsing / retry scenarios
+<details>
+<summary><strong>Parsing / retry scenarios</strong></summary>
 
 | Input | Result |
 |---|---|
@@ -233,45 +264,14 @@ Binary providers without a text field can use query directives: `POST /v1/audio/
 | provider is `http://127.0.0.1:8000`, `https://192.168.1.1`, `https://169.254.169.254`, `[::1]` | rejected (`blocked_provider`) before any connection |
 | `[provider=hello]` | `invalid_provider` |
 
-## Architecture (sections in `worker.js`)
-
-1. Configuration (`BASE_CONFIG` + `RELAY_*` Worker variables, resolved per request)
-2. Constants (directive registry, compatibility table, field-name sets, SSRF blocklists)
-3. Small utilities (typed directive-value parsers, env parsing)
-4. CORS
-5. Error helpers (structured `relay_error` responses)
-6. Directive parsing (linear scanner, first-wins state)
-7. JSON traversal (copy-on-write, conservative text-field scan, protected fields)
-8. Request body preparation (JSON / multipart / urlencoded / text / opaque, with hard read caps)
-9. Compatibility detection (directive → path → generic)
-10–11. Provider URL validation, SSRF protection, path joining
-12–13. Auth headers, request/response header policy
-14–16. Retry calculations, `Retry-After` parsing, the retry loop
-17–19. Response construction, main handler, `export default { fetch }`
-
-## Cloudflare platform limits (read this)
-
-**"Infinite retry" is best-effort, by platform design.** The loop keeps retrying while the invocation lives, but no Worker can guarantee unlimited retries because:
-
-- **Subrequest budget**: 50 outbound requests per invocation on the free plan, 1000 on paid. Every retry and every redirect hop consumes one. When exhausted, Cloudflare throws and the relay returns `subrequest_limit` instead of pretending otherwise.
-- **CPU time**: ~10 ms free / 30 s paid (configurable). Sleeping between retries is free, but scanning/parsing costs CPU.
-- **Client connection**: if the caller goes away, the relay stops immediately — retrying for a disconnected client is pointless.
-- **One-shot bodies**: a streamed upload cannot be replayed, so those requests get exactly one attempt.
-- **Memory**: 128 MB per isolate. Body reads are hard-capped during the read (24 MB default) so a lying `Content-Length` cannot exhaust memory.
-
-## Security considerations
-
-- **SSRF**: only `https://` providers by default (`RELAY_ALLOW_HTTP=true` opts into http for local dev). Blocked: loopback and all IPv4 private/reserved ranges, IPv6 loopback/link-local/unique-local/NAT64/6to4 with private embedded addresses, cloud metadata hosts, `.internal`/`.local`-style suffixes, single-label intranet names — in decimal, octal, hex and mixed notations. Redirects are followed by the relay itself so every hop is re-checked; credentials are dropped on cross-origin hops. URLs with `user:pass@` are rejected.
-  - *Known limitation*: a public DNS name that resolves to a private address (DNS rebinding) cannot be detected from inside a Worker — use `RELAY_PROVIDER_ALLOWLIST` for a hard guarantee.
-- **Allowlist**: `RELAY_PROVIDER_ALLOWLIST="api.openai.com,*.openai.azure.com"` restricts every request (and redirect hop) to those hosts. The private-network policy applies even inside the allowlist.
-- **Secrets**: `[key=…]` never reaches the model text, error responses, or logs (debug logs show `***` only). Error responses never echo prompt content. Consumed `?key=` and `?relay_session=` query params are stripped from the forwarded URL. Cookies and `CF-*`/`X-Forwarded-*`/`X-Real-IP` headers are never forwarded upstream. Session tokens carry the caller's key — set `RELAY_SESSION_SECRET` to make them AES-GCM encrypted instead of readable base64, and treat them as secrets in either mode.
-- **CORS**: open by default (`Access-Control-Allow-Origin: *` — this is a public relay, so treat it as such). Credential mode requires an explicit origin list and is otherwise ignored.
-- **DoS**: the directive scanner is a linear-time, budget-capped parser (no regex backtracking); JSON traversal and string scans have node/depth/length caps; body reads are capped mid-stream; per-request retry budgets are capped at 1000.
-- **Do not** put this Worker behind a domain you also use for internal admin tooling; it is an open forward relay to public HTTPS hosts by design.
+</details>
 
 ## Configuration
 
-Everything in `BASE_CONFIG` can be overridden with plain-text Worker variables:
+Everything in `BASE_CONFIG` can be overridden with plain-text Worker variables (dashboard → **Settings → Variables**, or `[vars]` in `wrangler.toml`):
+
+<details open>
+<summary><strong>All <code>RELAY_*</code> variables</strong></summary>
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -300,14 +300,56 @@ Everything in `BASE_CONFIG` can be overridden with plain-text Worker variables:
 | `RELAY_DEBUG` | `false` | Verbose (secret-free) logging |
 | `RELAY_DIAGNOSTIC_HEADERS` | `true` | `X-Relay-*` response headers |
 
-## Deploy from the dashboard
+</details>
 
-1. Cloudflare dashboard → **Workers & Pages** → **Create** → **Create Worker** → Deploy.
-2. **Edit code**: delete the scaffold, paste the entire contents of `worker.js`, **Deploy**.
-3. Your relay is live at `https://<worker-name>.<account>.workers.dev`. Test: `GET /__relay/health` should return `{"ok":true,…}` and `GET /` returns the usage document.
-4. Optional: **Settings → Variables** to set any `RELAY_*` overrides above (all plain text); **Settings → Domains & Routes** to attach a custom domain.
+## Security considerations
 
-With wrangler instead: `npm i -g wrangler && wrangler deploy` in this folder (`wrangler.toml` is included).
+- **SSRF**: only `https://` providers by default (`RELAY_ALLOW_HTTP=true` opts into http for local dev). Blocked: loopback and all IPv4 private/reserved ranges, IPv6 loopback/link-local/unique-local/NAT64/6to4 with private embedded addresses, cloud metadata hosts, `.internal`/`.local`-style suffixes, single-label intranet names — in decimal, octal, hex and mixed notations. Redirects are followed by the relay itself so every hop is re-checked; credentials are dropped on cross-origin hops. URLs with `user:pass@` are rejected.
+  - *Known limitation*: a public DNS name that resolves to a private address (DNS rebinding) cannot be detected from inside a Worker — use `RELAY_PROVIDER_ALLOWLIST` for a hard guarantee.
+- **Allowlist**: `RELAY_PROVIDER_ALLOWLIST="api.openai.com,*.openai.azure.com"` restricts every request (and redirect hop) to those hosts. The private-network policy applies even inside the allowlist.
+- **Secrets**: `[key=…]` never reaches the model text, error responses, or logs (debug logs show `***` only). Error responses never echo prompt content. Consumed `?key=` and `?relay_session=` query params are stripped from the forwarded URL. Cookies and `CF-*`/`X-Forwarded-*`/`X-Real-IP` headers are never forwarded upstream. Session tokens carry the caller's key — set `RELAY_SESSION_SECRET` to make them AES-GCM encrypted instead of readable base64, and treat them as secrets in either mode.
+- **CORS**: open by default (`Access-Control-Allow-Origin: *` — this is a public relay, so treat it as such). Credential mode requires an explicit origin list and is otherwise ignored.
+- **DoS**: the directive scanner is a linear-time, budget-capped parser (no regex backtracking); JSON traversal and string scans have node/depth/length caps; body reads are capped mid-stream; per-request retry budgets are capped at 1000.
+- **Do not** put this Worker behind a domain you also use for internal admin tooling; it is an open forward relay to public HTTPS hosts by design.
+
+## Cloudflare platform limits (read this)
+
+**"Infinite retry" is best-effort, by platform design.** The loop keeps retrying while the invocation lives, but no Worker can guarantee unlimited retries because:
+
+- **Subrequest budget**: 50 outbound requests per invocation on the free plan, 1000 on paid. Every retry and every redirect hop consumes one. When exhausted, Cloudflare throws and the relay returns `subrequest_limit` instead of pretending otherwise.
+- **CPU time**: ~10 ms free / 30 s paid (configurable). Sleeping between retries is free, but scanning/parsing costs CPU.
+- **Client connection**: if the caller goes away, the relay stops immediately — retrying for a disconnected client is pointless.
+- **One-shot bodies**: a streamed upload cannot be replayed, so those requests get exactly one attempt.
+- **Memory**: 128 MB per isolate. Body reads are hard-capped during the read (24 MB default) so a lying `Content-Length` cannot exhaust memory.
+
+## Architecture (sections in `worker.js`)
+
+<details>
+<summary><strong>Section map</strong></summary>
+
+- **1 — Configuration** (`BASE_CONFIG` + `RELAY_*` Worker variables, resolved per request)
+- **2 — Constants** (directive registry, compatibility table, field-name sets, SSRF blocklists)
+- **3 — Small utilities** (typed directive-value parsers, env parsing)
+- **4 — CORS**
+- **5 — Error helpers** (structured `relay_error` responses)
+- **6 — Directive parsing** (linear scanner, first-wins state)
+- **6b — Session tokens** (sticky directives for subagents and compaction)
+- **6c — IP memory** (directives that stick to the caller's IP)
+- **7 — JSON traversal** (copy-on-write, conservative text-field scan, protected fields)
+- **8 — Request body preparation** (JSON / multipart / urlencoded / text / opaque, with hard read caps)
+- **9 — Compatibility detection** (directive → path → generic)
+- **10 — Provider URL validation + SSRF protection**
+- **11 — Path joining**
+- **12 — Authentication headers**
+- **13 — Header sanitization**
+- **14 — Retry calculations**
+- **15 — Retry-After parser**
+- **16 — Upstream fetch + retry loop**
+- **17 — Response construction**
+- **18 — Request handler**
+- **19 — `export default { fetch }`**
+
+</details>
 
 ## Run it locally
 
@@ -321,13 +363,6 @@ PORT=9000 node dev-server.mjs  # custom port (also: --port 9000)
 ```
 
 `dev-server.mjs` adapts Node's HTTP server to the Worker API, so the **same `worker.js` that deploys to Cloudflare** runs on your machine. For convenience it defaults `RELAY_ALLOW_HTTP=true` and `RELAY_ALLOW_PRIVATE_NETWORKS=true` so you can point `[provider=…]` at a localhost service (e.g. Ollama, LM Studio, or any OpenAI-compatible server) — set those env vars to `false` to rehearse production's SSRF behaviour. Every request is logged with status and duration.
-
-```bash
-# example: relay to a local Ollama
-curl http://localhost:8787/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"سلام! [provider=http://127.0.0.1:11434/v1] [model=llama3.1]"}]}'
-```
 
 ### Option B — wrangler dev (closest to production)
 
@@ -359,3 +394,7 @@ Two local-run behaviours worth knowing:
 The suite covers all 15 spec scenarios (first-wins parsing, unicode, vision/video preservation, TTS binary, multipart STT, SSE streaming latency, 429-retry, 401 passthrough, SSRF rejections, malformed providers) plus regressions for every finding from three independent reviews (CPU-bounded scanning, prototype pollution, redirect credential stripping, capped body reads, allowlist ordering, Set-Cookie/Content-Encoding passthrough, and more).
 
 Note the integration tests run on Node (undici); a few runtime details differ on workerd — in particular WebSocket passthrough (`Upgrade: websocket`) is best-effort and worth one manual smoke test after deploying.
+
+---
+
+**English** · [فارسی](README.fa.md)
